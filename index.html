@@ -341,7 +341,7 @@ const POOL = 25;
 const BREAKOUT_LIMIT = 15;
 const GLIDE_END = 7.2;
 const UW_TARGET = 0.26;
-const UW_CAP = 3.4;
+const UW_CAP = 2.58;
 const KEY_PREFIX = "super-fly-timeattack-v1";
 let W = 0, H = 0, DPR = 1, state = STATE.TITLE, raf = 0;
 let raceDistance = 50, pairWindow = 130, playerName = "", personalBest = null;
@@ -355,7 +355,7 @@ const game = {
   pendingSide: "", pendingAt: 0, pendingTimer: 0, lastStrokeAt: 0, lastKickAt: 0,
   strokeCount: 0, goodRhythm: 0, rhythmTotal: 0, combo: 0, maxCombo: 0,
   breathAt: 0, breathCount: 0, phase: 0, kickAnim: 0, laneShake: 0,
-  starter: "", lastFinishWall: false
+  starter: "", lastFinishWall: false, strobeAt: 0
 };
 
 function viewportSize() {
@@ -488,6 +488,10 @@ function inUnderwater() { return game.dove && !game.surfaced; }
 function inSpurt() { return game.dist >= raceDistance - 10; }
 function atTurnZone() { return game.leg < totalLegs() && distInLeg() >= 22.2; }
 function atFinishZone() { return game.leg === totalLegs() && game.dist >= raceDistance - 1.4; }
+// ヒント表示(Zone)は手前から、実際のターン/ゴール成立(Wall)は壁際のみ。
+// 手前でターンさせると距離をワープ先取りできてしまうため成立は壁際に限定する
+function atTurnWall() { return game.leg < totalLegs() && distInLeg() >= 24.0; }
+function atFinishWall() { return game.leg === totalLegs() && game.dist >= raceDistance - 0.7; }
 function fmt(sec) {
   if (sec == null || !isFinite(sec)) return "--.--";
   const m = Math.floor(sec / 60);
@@ -505,7 +509,7 @@ function resetRace() {
     pendingSide: "", pendingAt: 0, pendingTimer: 0, lastStrokeAt: 0, lastKickAt: 0,
     strokeCount: 0, goodRhythm: 0, rhythmTotal: 0, combo: 0, maxCombo: 0,
     breathAt: 0, breathCount: 0, phase: 0, kickAnim: 0, laneShake: 0,
-    starter: "", lastFinishWall: false
+    starter: "", lastFinishWall: false, strobeAt: 0
   });
   particles = [];
   rings = [];
@@ -537,6 +541,7 @@ function startSequence() {
       game.starter = "";
       game.signalAt = performance.now();
       game.startAt = game.signalAt;
+      game.strobeAt = game.signalAt;
       startBeep();
       setMsg("GO!", 700, "#3df28f");
     }, delay));
@@ -567,7 +572,7 @@ function dive() {
   game.dove = true;
   game.rt = Math.max(0, (performance.now() - game.signalAt) / 1000);
   const rtBonus = Math.max(.65, Math.min(1.2, 1.15 - Math.max(0, game.rt - .22)));
-  game.vel = 3.5 * rtBonus;
+  game.vel = 2.62 * rtBonus;
   game.lastKickAt = performance.now();
   game.breathAt = performance.now();
   splash(0, 38, 1.25);
@@ -614,8 +619,9 @@ function dolphinKick(strong) {
       q = err < .07 ? 1.3 : (err < .15 ? 1.0 : .6);
     }
     const fatigue = game.stamina > 35 ? 1 : .4 + .6 * (game.stamina / 35);
-    game.vel = Math.min(UW_CAP, game.vel + .5 * q * fatigue);
-    game.stamina = Math.max(0, game.stamina - .6);
+    // 飛び込み・ターン直後はキャップ超えの高速グライド中。キックで減速させない
+    game.vel = Math.max(game.vel, Math.min(UW_CAP, game.vel + .5 * q * fatigue));
+    game.stamina = Math.max(0, game.stamina - .5);
     game.kickAnim = 1;
     game.rhythmTotal++;
     if (q >= 1.3) game.goodRhythm++;
@@ -641,15 +647,15 @@ function dolphinKick(strong) {
     game.rhythmTotal++;
   }
   const fatigue = game.stamina > 25 ? 1 : .55 + game.stamina / 60;
-  game.vel = Math.min(3.1, game.vel + boost * fatigue);
-  game.stamina = Math.max(0, game.stamina - .55);
+  game.vel = Math.max(game.vel, Math.min(2.35, game.vel + boost * fatigue));
+  game.stamina = Math.max(0, game.stamina - .42);
   game.kickAnim = 1;
   wake(9, .9);
   tone(260 + Math.random() * 80, .045, "triangle", .08);
 }
 function oneHandPenalty() {
   if (!game.dove || state !== STATE.SWIM) return;
-  if (atTurnZone() || atFinishZone()) { disqualify("turn"); return; }
+  if (atTurnWall() || atFinishWall()) { disqualify("turn"); return; }
   if (inUnderwater()) { dolphinKick(false); return; }
   game.vel *= .78;
   game.stamina = Math.max(0, game.stamina - 1.1);
@@ -660,8 +666,8 @@ function oneHandPenalty() {
 function pairedHands(diffMs) {
   if (!game.dove) { dive(); return; }
   if (inUnderwater()) { surface(); return; }
-  if (atTurnZone()) { turn(diffMs); return; }
-  if (atFinishZone()) { finish(diffMs); return; }
+  if (atTurnWall()) { turn(diffMs); return; }
+  if (atFinishWall()) { finish(diffMs); return; }
   const now = performance.now();
   game.strokeCount++;
   game.rhythmTotal++;
@@ -673,11 +679,19 @@ function pairedHands(diffMs) {
   if (breathGap > 4100) breathScore = .55;
   else if (breathGap < 900) breathScore = .72;
   const score = (syncScore * .48) + (rhythmScore * .34) + (breathScore * .18);
-  const fatigue = game.stamina > 28 ? 1 : .45 + game.stamina / 50;
+  // 疲労は40を切ると徐々に効く。100mで滑らかなポジティブスプリットになるよう早めに開始
+  const fatigue = game.stamina > 40 ? 1 : .28 + game.stamina / 95;
   let boost = (.48 + score * .82) * fatigue;
   if (inSpurt()) boost *= 1.23;
-  game.vel = Math.min(inSpurt() ? 3.55 : 3.15, game.vel + boost);
-  game.stamina = Math.max(0, game.stamina - (inSpurt() ? 1.4 : 1.9));
+  // 両手を速く連打しても水を掴めず空回り。落ち着いたテンポこそ最速にする
+  if (game.lastStrokeAt && strokeGap < 560) {
+    boost *= .4;
+    game.stamina = Math.max(0, game.stamina - 1.6);
+    setMsg("速すぎる - 空回り", 420, "#ffbd30");
+  }
+  // ブレイクアウト直後などキャップ超えの速度をストロークで殺さず、抵抗で自然に落とす
+  game.vel = Math.max(game.vel, Math.min(inSpurt() ? 2.68 : 2.4, game.vel + boost));
+  game.stamina = Math.max(0, game.stamina - (inSpurt() ? 1.2 : 1.55));
   game.oxygen = Math.max(0, game.oxygen - (breathGap > 3600 ? 4.5 : 2.1));
   game.lastStrokeAt = now;
   game.phase = 1;
@@ -706,7 +720,7 @@ function turn(diffMs) {
   game.leg++;
   if (game.leg === 3) game.split50 = (performance.now() - game.startAt) / 1000;
   game.dist = legStart();
-  game.vel = Math.max(2.55, 3.25 * acc);
+  game.vel = Math.max(1.95, 2.48 * acc);
   game.surfaced = false;
   game.pendingSide = "";
   game.combo = Math.max(0, game.combo - 1);
@@ -860,14 +874,15 @@ function update(now) {
   game.laneShake = Math.max(0, game.laneShake - dt * 2.5);
   if (state === STATE.SWIM && game.dove) {
     const underwater = inUnderwater();
-    const drag = underwater ? .46 : .92;
+    // 水上抵抗を抑えてストローク間の滑走を安定させる(高抵抗だと連打がリズムより速くなる)
+    const drag = underwater ? .46 : .58;
     game.vel *= Math.exp(-drag * dt);
     if (game.oxygen <= 0) {
-      game.vel *= Math.exp(-1.6 * dt);
+      game.vel *= Math.exp(-1.1 * dt);
       game.stamina = Math.max(0, game.stamina - 9 * dt);
       if (Math.random() < .08) setMsg("酸欠", 240, "#ff4669");
     }
-    if (game.stamina <= 0) game.vel *= Math.exp(-1.15 * dt);
+    if (game.stamina <= 0) game.vel *= Math.exp(-.82 * dt);
     game.dist += game.vel * dt;
     if (underwater) game.oxygen = Math.max(0, game.oxygen - 8.5 * dt);
     else {
@@ -1131,6 +1146,16 @@ function draw(now) {
     ctx.textAlign = "center";
     ctx.fillText("スタート!", W / 2, H * .38);
   }
+  // スタート号砲の全画面ストロボ閃光
+  if (game.strobeAt) {
+    const k = 1 - (now - game.strobeAt) / 320;
+    if (k > 0) {
+      ctx.globalAlpha = Math.max(0, k * 0.7);
+      ctx.fillStyle = "#ffffff";
+      ctx.fillRect(0, 0, W, H);
+      ctx.globalAlpha = 1;
+    }
+  }
 }
 function loop(now) {
   update(now);
@@ -1138,6 +1163,29 @@ function loop(now) {
   raf = requestAnimationFrame(loop);
 }
 raf = requestAnimationFrame(loop);
+
+// 公開前検証用の読み取り専用ハンドル。通常プレイには影響しません。
+window.__flyDebug = {
+  get stateName() { return Object.keys(STATE).find(k => STATE[k] === state) || String(state); },
+  get raceDistance() { return raceDistance; },
+  get leg() { return game.leg; },
+  get dist() { return game.dist; },
+  get distInLeg() { return distInLeg(); },
+  get vel() { return game.vel; },
+  get underwater() { return inUnderwater(); },
+  get dove() { return game.dove; },
+  get surfaced() { return game.surfaced; },
+  get stamina() { return game.stamina; },
+  get oxygen() { return game.oxygen; },
+  get combo() { return game.combo; },
+  get maxCombo() { return game.maxCombo; },
+  get rt() { return game.rt; },
+  get final() { return game.final; },
+  get split50() { return game.split50; },
+  get rhythmPct() { return game.rhythmTotal ? Math.round(game.goodRhythm / game.rhythmTotal * 100) : 0; },
+  get pairWindow() { return pairWindow; },
+  get canvas() { return { W, H, DPR }; }
+};
 
 function getRanks() {
   try {
